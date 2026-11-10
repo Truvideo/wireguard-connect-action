@@ -1,0 +1,22 @@
+name: WireGuard
+description: Connect to WireGuard for GitHub IPv4 traffic.
+inputs:
+  config:
+    description: WireGuard configuration.
+  operation:
+    description: connect or disconnect.
+    default: connect
+  state-directory:
+    description: Connect output used for explicit disconnect.
+outputs:
+  state-directory:
+    description: Temporary state directory.
+  interface:
+    description: Tunnel interface.
+  wireguard-bin:
+    description: WireGuard binary directory.
+runs:
+  using: node24
+  main: index.js
+  post: index.js
+  post-if: always()
