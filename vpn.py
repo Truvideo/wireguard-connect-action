@@ -74,6 +74,17 @@ def route(address):
     return {key.strip(): value.strip() for line in text.splitlines() if ':' in line
             for key, value in [line.split(':', 1)]}
 
+def internet_public_ip(address):
+    value = run('curl', '--disable', '-4', '--noproxy', '*', '--fail', '--silent', '--show-error',
+                '--resolve', 'checkip.amazonaws.com:443:' + address,
+                '--max-time', '15', 'https://checkip.amazonaws.com')
+    try:
+        if not ipaddress.IPv4Address(value).is_global:
+            raise ValueError()
+    except ValueError:
+        raise ActionError('Invalid normal Internet control response.') from None
+    return value
+
 def github_ranges(metadata):
     networks = set()
     try:
@@ -214,12 +225,21 @@ def connect(directory):
     default = route('default')
     if default.get('interface', '').startswith('utun'):
         raise ActionError('Runner already has a VPN default route.')
-    diagnostic('Stage: record normal Internet public IPv4 address.')
-    public_ip = run('curl', '-4', '--noproxy', '*', '--fail', '--silent', '--show-error',
-                    '--max-time', '15', 'https://checkip.amazonaws.com')
-    if not ipaddress.IPv4Address(public_ip).is_global:
-        raise ActionError('Invalid normal Internet control response.')
-    baseline = {'public_ip': public_ip, 'interface': default['interface'], 'gateway': default['gateway']}
+    diagnostic('Stage: record normal Internet control route and public IPv4 address.')
+    addresses = sorted({entry[4][0] for entry in socket.getaddrinfo(
+        'checkip.amazonaws.com', None, socket.AF_INET, socket.SOCK_STREAM)})
+    if not addresses or any(not ipaddress.IPv4Address(address).is_global for address in addresses):
+        raise ActionError('Normal Internet control did not resolve to public IPv4 addresses.')
+    control_address = addresses[0]
+    control = route(control_address)
+    if control.get('interface') != default['interface'] or not control.get('gateway'):
+        raise ActionError('Normal Internet control does not use the original default interface.')
+    control = {key: control[key] for key in ('interface', 'gateway')}
+    public_ip = internet_public_ip(control_address)
+    diagnostic('Normal Internet before: destination=' + control_address + ', interface=' +
+               control['interface'] + ', gateway=' + control['gateway'] + ', public_ip=' + public_ip)
+    baseline = {'public_ip': public_ip, 'interface': default['interface'], 'gateway': default['gateway'],
+                'control_address': control_address, 'control_route': control}
     (root / 'baseline.json').write_text(json.dumps(baseline))
     diagnostic('Stage: fetch GitHub metadata over HTTPS.')
     request = urllib.request.Request('https://api.github.com/meta',
@@ -230,6 +250,8 @@ def connect(directory):
         metadata = json.load(response)
     diagnostic('Stage: validate GitHub IPv4 ranges and prepare private tunnel files.')
     cidrs = github_ranges(metadata)
+    if any(ipaddress.IPv4Address(control_address) in ipaddress.IPv4Network(cidr) for cidr in cidrs):
+        raise ActionError('Normal Internet control overlaps the GitHub VPN routes.')
     sanitized, endpoint, secrets = parse_config(raw, cidrs)
     (root / 'github-cidrs.json').write_text(json.dumps(cidrs))
     (root / 'vpn-endpoint.txt').write_text(endpoint)
@@ -271,11 +293,20 @@ def connect(directory):
     current = route('default')
     if any(current.get(key) != baseline[key] for key in ('interface', 'gateway')):
         raise ActionError('WireGuard changed the normal Internet default route.')
-    diagnostic('Stage: verify unchanged normal Internet public IPv4 address.')
-    after_ip = run('curl', '-4', '--noproxy', '*', '--fail', '--silent', '--show-error',
-                   '--max-time', '15', 'https://checkip.amazonaws.com')
+    diagnostic('Stage: verify normal Internet control stays on its original route.')
+    current_control = route(control_address)
+    if any(current_control.get(key) != control[key] for key in ('interface', 'gateway')):
+        raise ActionError('WireGuard changed the normal Internet control route.')
+    after_ip = internet_public_ip(control_address)
+    current_control = route(control_address)
+    if any(current_control.get(key) != control[key] for key in ('interface', 'gateway')):
+        raise ActionError('Normal Internet control route changed during its HTTPS request.')
+    diagnostic('Normal Internet after: destination=' + control_address + ', interface=' +
+               current_control['interface'] + ', gateway=' + current_control['gateway'] +
+               ', public_ip=' + after_ip)
     if after_ip != public_ip:
-        raise ActionError('Normal Internet egress changed after connecting.')
+        diagnostic('::warning::Normal Internet public IPv4 changed; the control destination, '
+                   'interface, gateway and default route remain unchanged.')
     diagnostic('WireGuard connected: GitHub IPv4 routes, HTTPS, handshake and normal Internet verified.')
     return {'state-directory': str(root), 'interface': interface,
             'wireguard-bin': bins}
