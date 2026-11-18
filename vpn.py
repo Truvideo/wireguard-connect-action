@@ -18,10 +18,17 @@ import time
 import urllib.error
 import urllib.request
 
+DOWNLOAD_BUDGET_SECONDS = 45
+DOWNLOAD_TIMEOUT_SECONDS = 10
+RETRY_DELAY_SECONDS = 2
+
 class ActionError(Exception):
     pass
 
 class ActionInterrupted(ActionError):
+    pass
+
+class DownloadBudgetExpired(ActionError):
     pass
 
 def diagnostic(message):
@@ -111,19 +118,56 @@ def github_ranges(metadata):
     return [str(network) for network in ipaddress.collapse_addresses(networks)]
 
 def fetch_github_ranges():
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+
+    def expired(signum, frame):
+        raise DownloadBudgetExpired('GitHub range download time budget exhausted.')
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, DOWNLOAD_BUDGET_SECONDS)
+    try:
+        return _fetch_github_ranges(started + DOWNLOAD_BUDGET_SECONDS)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            remaining = max(0.001, previous_timer[0] - (time.monotonic() - started))
+            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
+
+def _fetch_github_ranges(deadline):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def read_json(url):
         request = urllib.request.Request(url, headers={'User-Agent': 'wireguard-connect-action'})
-        with opener.open(request, timeout=20) as response:
-            raw = response.read(1024 * 1024 + 1)
+        for attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DownloadBudgetExpired('GitHub range download time budget exhausted.')
+            try:
+                with opener.open(request, timeout=min(DOWNLOAD_TIMEOUT_SECONDS, remaining)) as response:
+                    raw = response.read(1024 * 1024 + 1)
+                break
+            except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+                reason = error.reason if isinstance(error, urllib.error.URLError) else error
+                retry = isinstance(reason, (TimeoutError, ConnectionError, http.client.HTTPException))
+                retry = retry or (isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN)
+                if isinstance(error, urllib.error.HTTPError):
+                    limited = error.headers and (error.headers.get('Retry-After') or error.headers.get('X-RateLimit-Remaining') == '0')
+                    retry = error.code in (502, 503, 504) and not limited
+                if attempt or not retry or deadline - time.monotonic() <= RETRY_DELAY_SECONDS:
+                    raise
+                diagnostic('Retrying ' + request.host + ' range download in ' + str(RETRY_DELAY_SECONDS) +
+                           ' seconds (' + type(error).__name__ + ').')
+                time.sleep(RETRY_DELAY_SECONDS)
         if len(raw) > 1024 * 1024:
             raise ActionError('GitHub range response exceeds the size limit.')
         return json.loads(raw)
 
     try:
         return github_ranges(read_json('https://api.github.com/meta'))
-    except ActionInterrupted:
+    except (ActionInterrupted, DownloadBudgetExpired):
         raise
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError, ActionError) as error:
         diagnostic('::warning::GitHub Meta unavailable; attempting public fallback. ' + failure_detail(error))
@@ -148,7 +192,7 @@ def fetch_github_ranges():
         cidrs = github_ranges({service: entries for service in ('web', 'api', 'git')})
         if len(cidrs) < 10:
             raise ValueError()
-    except ActionInterrupted:
+    except (ActionInterrupted, DownloadBudgetExpired):
         raise
     except Exception as error:
         diagnostic('Public GitHub fallback failed: ' + failure_detail(error))
