@@ -1,6 +1,7 @@
 import base64
 import configparser
 import datetime
+import http.client
 import io
 import ipaddress
 import json
@@ -124,7 +125,7 @@ def fetch_github_ranges():
         return github_ranges(read_json('https://api.github.com/meta'))
     except ActionInterrupted:
         raise
-    except (urllib.error.URLError, OSError, ValueError, ActionError) as error:
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError, ActionError) as error:
         diagnostic('::warning::GitHub Meta unavailable; attempting public fallback. ' + failure_detail(error))
         if isinstance(error, urllib.error.HTTPError) and error.headers:
             limits = {name: error.headers.get(name) for name in
