@@ -1,5 +1,6 @@
 import base64
 import configparser
+import datetime
 import io
 import ipaddress
 import json
@@ -13,9 +14,13 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 class ActionError(Exception):
+    pass
+
+class ActionInterrupted(ActionError):
     pass
 
 def diagnostic(message):
@@ -95,7 +100,7 @@ def github_ranges(metadata):
             for entry in entries:
                 network = ipaddress.ip_network(entry)
                 if network.version == 4:
-                    if not network.is_global or network.prefixlen < 8:
+                    if not network.is_global or network.is_multicast or network.prefixlen < 8:
                         raise ValueError()
                     networks.add(network)
         if not networks or len(networks) > 512:
@@ -103,6 +108,53 @@ def github_ranges(metadata):
     except (ValueError, TypeError, AttributeError):
         raise ActionError('Invalid GitHub IPv4 range metadata.') from None
     return [str(network) for network in ipaddress.collapse_addresses(networks)]
+
+def fetch_github_ranges():
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def read_json(url):
+        request = urllib.request.Request(url, headers={'User-Agent': 'wireguard-connect-action'})
+        with opener.open(request, timeout=20) as response:
+            raw = response.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ActionError('GitHub range response exceeds the size limit.')
+        return json.loads(raw)
+
+    try:
+        return github_ranges(read_json('https://api.github.com/meta'))
+    except ActionInterrupted:
+        raise
+    except (urllib.error.URLError, OSError, ValueError, ActionError) as error:
+        diagnostic('::warning::GitHub Meta unavailable; attempting public fallback. ' + failure_detail(error))
+        if isinstance(error, urllib.error.HTTPError) and error.headers:
+            limits = {name: error.headers.get(name) for name in
+                      ('X-RateLimit-Remaining', 'X-RateLimit-Reset', 'Retry-After')}
+            diagnostic('GitHub response limits: ' + json.dumps(limits))
+
+    try:
+        snapshot = read_json('https://raw.githubusercontent.com/Truvideo/github-ips/master/github-ipv4.json')
+        if (not isinstance(snapshot, dict) or type(snapshot.get('schema_version')) is not int or
+                snapshot['schema_version'] != 1 or snapshot.get('source') != 'https://api.github.com/meta'):
+            raise ValueError()
+        fetched = datetime.datetime.strptime(snapshot['fetched_at'], '%Y-%m-%dT%H:%M:%SZ')
+        age = time.time() - fetched.replace(tzinfo=datetime.timezone.utc).timestamp()
+        if age < -300 or age > 72 * 60 * 60:
+            raise ValueError()
+        entries = snapshot['ipv4']
+        if (not isinstance(entries, list) or not 10 <= len(entries) <= 512 or
+                any(not isinstance(entry, str) or ipaddress.ip_network(entry).version != 4 for entry in entries)):
+            raise ValueError()
+        cidrs = github_ranges({service: entries for service in ('web', 'api', 'git')})
+        if len(cidrs) < 10:
+            raise ValueError()
+    except ActionInterrupted:
+        raise
+    except Exception as error:
+        diagnostic('Public GitHub fallback failed: ' + failure_detail(error))
+        raise ActionError('No valid GitHub ranges: API failed and fallback is unavailable, invalid or older than 72 hours.') from None
+    diagnostic('Using validated public fallback: ' + str(len(cidrs)) +
+               ' IPv4 ranges; fetched_at=' + snapshot['fetched_at'])
+    return cidrs
 
 def parse_config(raw, cidrs):
     config = configparser.ConfigParser(interpolation=None)
@@ -242,14 +294,8 @@ def connect(directory):
                 'control_address': control_address, 'control_route': control}
     (root / 'baseline.json').write_text(json.dumps(baseline))
     diagnostic('Stage: fetch GitHub metadata over HTTPS.')
-    request = urllib.request.Request('https://api.github.com/meta',
-                                     headers={'User-Agent': 'wireguard-connect-action'})
-
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=20) as response:
-        metadata = json.load(response)
+    cidrs = fetch_github_ranges()
     diagnostic('Stage: validate GitHub IPv4 ranges and prepare private tunnel files.')
-    cidrs = github_ranges(metadata)
     if any(ipaddress.IPv4Address(control_address) in ipaddress.IPv4Network(cidr) for cidr in cidrs):
         raise ActionError('Normal Internet control overlaps the GitHub VPN routes.')
     sanitized, endpoint, secrets = parse_config(raw, cidrs)
@@ -314,7 +360,7 @@ def connect(directory):
 def main():
     os.umask(0o077)
     def interrupted(signum, frame):
-        raise ActionError('WireGuard operation interrupted.')
+        raise ActionInterrupted('WireGuard operation interrupted.')
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     operation, directory = sys.argv[1:]
