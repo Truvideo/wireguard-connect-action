@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 class ActionError(Exception):
@@ -103,6 +104,29 @@ def github_ranges(metadata):
     except (ValueError, TypeError, AttributeError):
         raise ActionError('Invalid GitHub IPv4 range metadata.') from None
     return [str(network) for network in ipaddress.collapse_addresses(networks)]
+
+def fetch_github_metadata(token):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, response, code, message, headers, new_url):
+            raise ActionError('GitHub Meta redirects are not allowed.')
+
+    request = urllib.request.Request('https://api.github.com/meta', headers={
+        'User-Agent': 'wireguard-connect-action',
+        'Accept': 'application/vnd.github+json',
+        'Authorization': 'Bearer ' + token,
+    })
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    try:
+        with opener.open(request, timeout=20) as response:
+            diagnostic('GitHub Meta HTTP status: ' + str(response.status))
+            for name in ('X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'):
+                diagnostic(name + ': ' + str(response.headers.get(name, 'unavailable')))
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        diagnostic('GitHub Meta HTTP status: ' + str(error.code))
+        for name in ('X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'Retry-After'):
+            diagnostic(name + ': ' + str(error.headers.get(name, 'unavailable')))
+        raise
 
 def parse_config(raw, cidrs):
     config = configparser.ConfigParser(interpolation=None)
@@ -201,6 +225,9 @@ def disconnect(directory, final=True):
 def connect(directory):
 
     raw = os.environ.pop('INPUT_CONFIG', '')
+    token = os.environ.pop('INPUT_GITHUB-TOKEN', '').strip()
+    if not token:
+        raise ActionError('The github-token input is required for the authenticated Meta test.')
     diagnostic('Stage: validate runner and private configuration.')
     if platform.system() != 'Darwin':
         raise ActionError('This action currently supports macOS runners only.')
@@ -241,13 +268,9 @@ def connect(directory):
     baseline = {'public_ip': public_ip, 'interface': default['interface'], 'gateway': default['gateway'],
                 'control_address': control_address, 'control_route': control}
     (root / 'baseline.json').write_text(json.dumps(baseline))
-    diagnostic('Stage: fetch GitHub metadata over HTTPS.')
-    request = urllib.request.Request('https://api.github.com/meta',
-                                     headers={'User-Agent': 'wireguard-connect-action'})
-
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=20) as response:
-        metadata = json.load(response)
+    diagnostic('Stage: fetch GitHub metadata using the job token before VPN connection.')
+    metadata = fetch_github_metadata(token)
+    del token
     diagnostic('Stage: validate GitHub IPv4 ranges and prepare private tunnel files.')
     cidrs = github_ranges(metadata)
     if any(ipaddress.IPv4Address(control_address) in ipaddress.IPv4Network(cidr) for cidr in cidrs):
@@ -324,6 +347,7 @@ def main():
             print(json.dumps(result))
         elif operation == 'disconnect':
             os.environ.pop('INPUT_CONFIG', None)
+            os.environ.pop('INPUT_GITHUB-TOKEN', None)
             disconnect(directory)
         else:
             raise ActionError('Invalid lifecycle operation.')

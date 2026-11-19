@@ -3,6 +3,9 @@ description: Connect to WireGuard for GitHub IPv4 traffic.
 inputs:
   config:
     description: WireGuard configuration.
+  github-token:
+    description: Job token used only for the GitHub Meta API request.
+    required: true
   operation:
     description: connect or disconnect.
     default: connect
