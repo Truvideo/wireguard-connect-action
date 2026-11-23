@@ -6,6 +6,7 @@ inputs:
   github-token:
     description: Job token used only for the GitHub Meta API request.
     required: true
+    default: ${{ github.token }}
   operation:
     description: connect or disconnect.
     default: connect
