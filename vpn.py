@@ -96,7 +96,7 @@ def github_ranges(metadata):
             for entry in entries:
                 network = ipaddress.ip_network(entry)
                 if network.version == 4:
-                    if not network.is_global or network.prefixlen < 8:
+                    if not network.is_global or network.is_multicast or network.prefixlen < 8:
                         raise ValueError()
                     networks.add(network)
         if not networks or len(networks) > 512:
