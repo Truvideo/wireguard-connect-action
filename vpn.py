@@ -1,7 +1,5 @@
 import base64
 import configparser
-import datetime
-import http.client
 import io
 import ipaddress
 import json
@@ -18,17 +16,7 @@ import time
 import urllib.error
 import urllib.request
 
-DOWNLOAD_BUDGET_SECONDS = 45
-DOWNLOAD_TIMEOUT_SECONDS = 10
-RETRY_DELAY_SECONDS = 2
-
 class ActionError(Exception):
-    pass
-
-class ActionInterrupted(ActionError):
-    pass
-
-class DownloadBudgetExpired(ActionError):
     pass
 
 def diagnostic(message):
@@ -117,89 +105,28 @@ def github_ranges(metadata):
         raise ActionError('Invalid GitHub IPv4 range metadata.') from None
     return [str(network) for network in ipaddress.collapse_addresses(networks)]
 
-def fetch_github_ranges():
-    previous_handler = signal.getsignal(signal.SIGALRM)
-    previous_timer = signal.getitimer(signal.ITIMER_REAL)
-    started = time.monotonic()
+def fetch_github_metadata(token):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, response, code, message, headers, new_url):
+            raise ActionError('GitHub Meta redirects are not allowed.')
 
-    def expired(signum, frame):
-        raise DownloadBudgetExpired('GitHub range download time budget exhausted.')
-
-    signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, DOWNLOAD_BUDGET_SECONDS)
+    request = urllib.request.Request('https://api.github.com/meta', headers={
+        'User-Agent': 'wireguard-connect-action',
+        'Accept': 'application/vnd.github+json',
+        'Authorization': 'Bearer ' + token,
+    })
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
-        return _fetch_github_ranges(started + DOWNLOAD_BUDGET_SECONDS)
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
-        if previous_timer[0] > 0:
-            remaining = max(0.001, previous_timer[0] - (time.monotonic() - started))
-            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
-
-def _fetch_github_ranges(deadline):
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    def read_json(url):
-        request = urllib.request.Request(url, headers={'User-Agent': 'wireguard-connect-action'})
-        for attempt in range(2):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise DownloadBudgetExpired('GitHub range download time budget exhausted.')
-            try:
-                with opener.open(request, timeout=min(DOWNLOAD_TIMEOUT_SECONDS, remaining)) as response:
-                    raw = response.read(1024 * 1024 + 1)
-                break
-            except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
-                reason = error.reason if isinstance(error, urllib.error.URLError) else error
-                retry = isinstance(reason, (TimeoutError, ConnectionError, http.client.HTTPException))
-                retry = retry or (isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN)
-                if isinstance(error, urllib.error.HTTPError):
-                    limited = error.headers and (error.headers.get('Retry-After') or error.headers.get('X-RateLimit-Remaining') == '0')
-                    retry = error.code in (502, 503, 504) and not limited
-                if attempt or not retry or deadline - time.monotonic() <= RETRY_DELAY_SECONDS:
-                    raise
-                diagnostic('Retrying ' + request.host + ' range download in ' + str(RETRY_DELAY_SECONDS) +
-                           ' seconds (' + type(error).__name__ + ').')
-                time.sleep(RETRY_DELAY_SECONDS)
-        if len(raw) > 1024 * 1024:
-            raise ActionError('GitHub range response exceeds the size limit.')
-        return json.loads(raw)
-
-    try:
-        return github_ranges(read_json('https://api.github.com/meta'))
-    except (ActionInterrupted, DownloadBudgetExpired):
+        with opener.open(request, timeout=20) as response:
+            diagnostic('GitHub Meta HTTP status: ' + str(response.status))
+            for name in ('X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'):
+                diagnostic(name + ': ' + str(response.headers.get(name, 'unavailable')))
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        diagnostic('GitHub Meta HTTP status: ' + str(error.code))
+        for name in ('X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset', 'Retry-After'):
+            diagnostic(name + ': ' + str(error.headers.get(name, 'unavailable')))
         raise
-    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError, ActionError) as error:
-        diagnostic('::warning::GitHub Meta unavailable; attempting public fallback. ' + failure_detail(error))
-        if isinstance(error, urllib.error.HTTPError) and error.headers:
-            limits = {name: error.headers.get(name) for name in
-                      ('X-RateLimit-Remaining', 'X-RateLimit-Reset', 'Retry-After')}
-            diagnostic('GitHub response limits: ' + json.dumps(limits))
-
-    try:
-        snapshot = read_json('https://raw.githubusercontent.com/Truvideo/github-ips/master/github-ipv4.json')
-        if (not isinstance(snapshot, dict) or type(snapshot.get('schema_version')) is not int or
-                snapshot['schema_version'] != 1 or snapshot.get('source') != 'https://api.github.com/meta'):
-            raise ValueError()
-        fetched = datetime.datetime.strptime(snapshot['fetched_at'], '%Y-%m-%dT%H:%M:%SZ')
-        age = time.time() - fetched.replace(tzinfo=datetime.timezone.utc).timestamp()
-        if age < -300 or age > 72 * 60 * 60:
-            raise ValueError()
-        entries = snapshot['ipv4']
-        if (not isinstance(entries, list) or not 10 <= len(entries) <= 512 or
-                any(not isinstance(entry, str) or ipaddress.ip_network(entry).version != 4 for entry in entries)):
-            raise ValueError()
-        cidrs = github_ranges({service: entries for service in ('web', 'api', 'git')})
-        if len(cidrs) < 10:
-            raise ValueError()
-    except (ActionInterrupted, DownloadBudgetExpired):
-        raise
-    except Exception as error:
-        diagnostic('Public GitHub fallback failed: ' + failure_detail(error))
-        raise ActionError('No valid GitHub ranges: API failed and fallback is unavailable, invalid or older than 72 hours.') from None
-    diagnostic('Using validated public fallback: ' + str(len(cidrs)) +
-               ' IPv4 ranges; fetched_at=' + snapshot['fetched_at'])
-    return cidrs
 
 def parse_config(raw, cidrs):
     config = configparser.ConfigParser(interpolation=None)
@@ -298,6 +225,9 @@ def disconnect(directory, final=True):
 def connect(directory):
 
     raw = os.environ.pop('INPUT_CONFIG', '')
+    token = os.environ.pop('INPUT_GITHUB-TOKEN', '').strip()
+    if not token:
+        raise ActionError('The github-token input is required for the authenticated Meta test.')
     diagnostic('Stage: validate runner and private configuration.')
     if platform.system() != 'Darwin':
         raise ActionError('This action currently supports macOS runners only.')
@@ -338,9 +268,11 @@ def connect(directory):
     baseline = {'public_ip': public_ip, 'interface': default['interface'], 'gateway': default['gateway'],
                 'control_address': control_address, 'control_route': control}
     (root / 'baseline.json').write_text(json.dumps(baseline))
-    diagnostic('Stage: fetch GitHub metadata over HTTPS.')
-    cidrs = fetch_github_ranges()
+    diagnostic('Stage: fetch GitHub metadata using the job token before VPN connection.')
+    metadata = fetch_github_metadata(token)
+    del token
     diagnostic('Stage: validate GitHub IPv4 ranges and prepare private tunnel files.')
+    cidrs = github_ranges(metadata)
     if any(ipaddress.IPv4Address(control_address) in ipaddress.IPv4Network(cidr) for cidr in cidrs):
         raise ActionError('Normal Internet control overlaps the GitHub VPN routes.')
     sanitized, endpoint, secrets = parse_config(raw, cidrs)
@@ -405,7 +337,7 @@ def connect(directory):
 def main():
     os.umask(0o077)
     def interrupted(signum, frame):
-        raise ActionInterrupted('WireGuard operation interrupted.')
+        raise ActionError('WireGuard operation interrupted.')
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     operation, directory = sys.argv[1:]
@@ -415,6 +347,7 @@ def main():
             print(json.dumps(result))
         elif operation == 'disconnect':
             os.environ.pop('INPUT_CONFIG', None)
+            os.environ.pop('INPUT_GITHUB-TOKEN', None)
             disconnect(directory)
         else:
             raise ActionError('Invalid lifecycle operation.')
